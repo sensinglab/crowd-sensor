@@ -1,4 +1,5 @@
 # Wi-Fi Crowd Sensor
+Edge software for data collection and local processing in privacy-preserving multi-sensor crowd sensing systems, supporting multi-RAN, multi-operator connectivity, seamless handover, and over-the-air updates.
 
 1. The wlan1 interface has to be put in "unmanaged" mode so that the Network Manager doesn't interfere with sensor <br>
 (https://support.qacafe.com/cdrouter/knowledge-base/prevent-network-manager-from-controlling-an-interface/) <br>
