@@ -1,4 +1,4 @@
-# Crowd_Detection_STToolkit
+# Wi-Fi Crowd Sensor
 
 1. The wlan1 interface has to be put in "unmanaged" mode so that the Network Manager doesn't interfere with sensor <br>
 (https://support.qacafe.com/cdrouter/knowledge-base/prevent-network-manager-from-controlling-an-interface/) <br>
