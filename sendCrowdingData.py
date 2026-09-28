@@ -1,281 +1,842 @@
+import joblib
+import pandas as pd
+import numpy as np
 import sqlite3
 import datetime as dt
 import matplotlib.pyplot as plt; plt.rcdefaults()
-import subprocess
+import time
+import sys
 import os
-import pytz
-import uuid
-import netifaces as ni
+import struct
 
+# Suppress TensorFlow Warnings
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+import logging
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+from tensorflow.keras.models import load_model
+
+from swARM_at_custom.swARM_at.RAK3172 import RAK3172
 from sensorFunctions import *
+from sensorFunctions import downlink_cb
+from communication_manager import CommunicationManager
+from event_logger import log_event
+from uart_lock import acquire_uart_lock, release_uart_lock, get_uart_lock_info
+from timeline_logger import log_timeline                        
 
-# Read sensor configuration from database
+MODEL_PATH = '/home/kali/Desktop/Sniffer/wifi_lstm_regressor.keras'
+SCALER_PATH = '/home/kali/Desktop/Sniffer/wifi_lstm_scaler.pkl'
+HISTORY_FILE = '/home/kali/Desktop/Sniffer/lstm_feature_history.csv'
+FEATURE_COLS = ['Total_Packets', 'Total_Bursts', 'Unique_MACs', 'Unique_Fingerprints', 'Packets_Per_Fingerprint', 'Bursts_Per_Fingerprint']
+TIME_STEPS = 3
+
+SEND_EXTENDED_FINGERPRINTS = False
+
+COMM_CHECK_LOCK_FILE = "/tmp/sensor_communication_check.lock"
+COMM_CHECK_LOCK_MAX_AGE_SEC = 70
+
+def wait_for_comm_check_lock(max_wait_sec=120, poll_sec=2):
+    waited = 0
+
+    while os.path.exists(COMM_CHECK_LOCK_FILE) and waited <= max_wait_sec:
+        try:
+            lock_age = time.time() - os.path.getmtime(COMM_CHECK_LOCK_FILE)
+
+            if lock_age > COMM_CHECK_LOCK_MAX_AGE_SEC:
+                print("[UPLOAD] Removing stale sensorCommunicationCheck.py lock.")
+                os.remove(COMM_CHECK_LOCK_FILE)
+                break
+
+        except Exception:
+            pass
+
+        print(f"[UPLOAD] Waiting for sensorCommunicationCheck.py to finish... waited={waited}s")
+        time.sleep(poll_sec)
+        waited += poll_sec
+
+    return not os.path.exists(COMM_CHECK_LOCK_FILE), waited
+
+
+_t0_send_cycle = time.monotonic()
+log_event("send_cycle_start")
+_t0_wall = dt.datetime.now(dt.timezone.utc)                     
+
+# Debug switch: set to False to silence debug prints
+DEBUG_COMM = True
+
+def dprint(msg):
+    if DEBUG_COMM:
+        print(f"[COMM-DEBUG] {msg}")
+
+def wait_for_lora_uart_lock(caller, max_wait_sec=60, poll_sec=3
+):
+    waited = 0
+
+    while waited <= max_wait_sec:
+        if acquire_uart_lock(caller):
+            return True, waited
+
+        info = get_uart_lock_info()
+        print(f"[UPLOAD] Waiting for LoRa UART lock... waited={waited}s info={info}")
+
+        time.sleep(poll_sec)
+        waited += poll_sec
+
+    return False, waited
+
+def handle_gap_fill_request(rak, payload_hex, current_seq, network_name):
+    """
+    Processa um downlink FPort 5 do servidor com last_seq.
+    Lê do buffer as medições em falta e envia via FPort 4.
+    """
+    try:
+        last_seq_server = int(payload_hex[:2], 16)
+
+        # Servidor confirmou que tem tudo até last_seq_server
+        set_last_confirmed_seq(last_seq_server)
+
+        gap = (current_seq - last_seq_server) % 256
+
+        print(
+            f"[GAP-FILL] Received request: server_last_seq={last_seq_server} "
+            f"current_seq={current_seq} gap={gap}"
+        )
+        log_event("gap_fill_request_received", link="lora", network=network_name, server_last_seq=last_seq_server, current_seq=current_seq, gap=gap)
+
+        if gap == 0 or gap > 256:
+            print("[GAP-FILL] No gap or invalid, ignoring.")
+            return
+
+        prev_seq = (current_seq - 1) % 256
+        measurements = buffer_get_range(last_seq_server, prev_seq)
+
+        if not measurements:
+            print("[GAP-FILL] No measurements in buffer for requested range.")
+            return
+
+        REPLAY_MAX = 10
+        batch = measurements[:REPLAY_MAX]
+        batch_size = len(batch)
+        seq_oldest = batch[0][0]
+        ts_oldest  = batch[0][1]
+
+        replay_payload = struct.pack(">BI", seq_oldest, ts_oldest)
+        for (_, _, devices) in batch:
+            replay_payload += struct.pack(">H", min(int(devices), 65535))
+
+        replay_hex = replay_payload.hex()
+        print(
+            f"[GAP-FILL] Sending {batch_size} measurements, "
+            f"SEQ_oldest={seq_oldest} TS_oldest={ts_oldest} hex={replay_hex}"
+        )
+
+        time.sleep(2)
+
+        _t0_replay = time.monotonic()
+        sent = rak.send_lorawan_data(4, replay_hex)
+        _dt_replay_ms = round((time.monotonic() - _t0_replay) * 1000, 2)
+
+        if sent:
+            log_event(
+                "gap_fill_sent",
+                link="lora",
+                network=network_name,
+                batch_size=batch_size,
+                seq_oldest=seq_oldest,
+                ts_oldest=ts_oldest,
+                server_last_seq=last_seq_server,
+                dispatch_ms=_dt_replay_ms,
+            )
+            print(f"[GAP-FILL] {batch_size} medições enviadas com sucesso.")
+        else:
+            log_event(
+                "gap_fill_failed",
+                link="lora",
+                network=network_name,
+                batch_size=batch_size,
+            )
+            print("[GAP-FILL] Falha no envio.")
+
+    except Exception as e:
+        print(f"[GAP-FILL] Erro: {e}")
+
+if not os.path.exists(BOOT_COMPLETE_FILE):
+    dprint("Boot initialization not complete yet. Exiting.")
+    exit(0)
+
+check_released, waited_for_check = wait_for_comm_check_lock(
+    max_wait_sec=120,
+    poll_sec=2
+)
+
+if not check_released:
+    print("[UPLOAD] sensorCommunicationCheck.py still running after timeout. Exiting to avoid stale DB state.")
+    exit(0)
+
+
+
+time.sleep(5)  # Initial delay to allow other processes to start and populate DBs
+
+waited_for_comm_available, available_released = wait_for_script_lock(
+    COMM_AVAILABLE_LOCK_FILE,
+    max_wait_sec=90,
+    poll_sec=2,
+    log_prefix="[COMM-DEBUG]"
+)
+
+if not available_released:
+    dprint("Lock still active after timeout; continuing carefully.")
+
+dprint(f"waited_for_comm_available={waited_for_comm_available}s")
 
 try:
-    connwifi= sqlite3.connect('/home/kali/Desktop/DB/SensorConfiguration.db' , timeout=30)
+    scaler = joblib.load(SCALER_PATH)
+    model = load_model(MODEL_PATH)
+except Exception as e:
+    print(f"Failed to load RF model: {e}")
+    sys.exit(1)
+
+# Read sensor configuration from database
+try:
+    connwifi = sqlite3.connect('/home/kali/Desktop/DB/SensorConfiguration.db', timeout=30)
     cwifi = connwifi.cursor()
 
     sensor_configuration = cwifi.execute("""SELECT * FROM SensorConfiguration""").fetchall()
 
-    #Sensor configuration
+    # Sensor configuration
     if len(sensor_configuration) != 0:
         sensorUUID = sensor_configuration[0][0]
         sensorName = sensor_configuration[0][1]
         influxdb_bucket = sensor_configuration[0][8]
-        slidingWindow = sensor_configuration[0][11]
-        uploadTechnology = sensor_configuration[0][12]
+        upload_periodicity = sensor_configuration[0][10]
+        # slidingWindow = sensor_configuration[0][11]
+        slidingWindow = 15
 
-        if uploadTechnology.lower() == "wifi":
-            ip_address = cwifi.execute("""SELECT IP_Address FROM SensorCommunication""").fetchone()[0]
-            wifi_connected = cwifi.execute("""SELECT WifiConnected FROM SensorCommunication""").fetchone()[0]
+        active_lora_network = None
+        if len(sensor_configuration[0]) > 16:
+            active_lora_network = sensor_configuration[0][16]
+
+        ip_address = cwifi.execute("""SELECT IP_Address FROM SensorCommunication""").fetchone()[0]
 
     else:
-        print("Sensor is not currently configured. It is required a cloud IP address to connect to the cloud server via MQTT.\nPlease run the 'sensorConfiguration.py' script to configure the sensor.")
+        print(
+            "Sensor is not currently configured. It is required a cloud IP address "
+            "to connect to the cloud server via MQTT.\nPlease run the "
+            "'sensorConfiguration.py' script to configure the sensor."
+        )
         exit(0)
 
-except sqlite3.Error as error:
+except sqlite3.Error:
     print("Failed to read sensor configuration from local database.")
     exit(0)
 
+dataAtual_aware = dt.datetime.now(dt.timezone.utc)
+dataAtual_unix = int(dataAtual_aware.timestamp())
 
-dataAtual=dt.datetime.now(pytz.utc)
-dataAnalizar= dataAtual - dt.timedelta(minutes=int(slidingWindow))
+detected_devices = 0
 
-
-# Get number of devices detected from database
+# Get extracted information from database
 try:
+    dr_con = sqlite3.connect('/home/kali/Desktop/MemoryDB/DeviceRecords.db', timeout=30)
 
-    conndev= sqlite3.connect('/home/kali/Desktop/MemoryDB/DeviceRecords.db' , timeout=30)
-    cdev = conndev.cursor()
+    now = time.time()
+    
+    current_start = now - (slidingWindow * 60)
+    current_end = now
+    
+    previous_start = current_start - (upload_periodicity * 60)
+    previous_end = current_end - (upload_periodicity * 60)
 
-    # Device counting - Data packets
-    rows_data_packets = cdev.execute("""SELECT COUNT(*) FROM Data_Packets WHERE ((First_Record >= ? and First_Record <= ?) or (Last_Time_Found > ? and Last_Time_Found <= ?))""", (dataAnalizar, dataAtual, dataAnalizar, dataAtual)).fetchall()
+    norm_new_fingerprints = 0.0
+    norm_disappeared_fingerprints = 0.0
 
-    # Device counting - Probe Requests
-    rows_probe_requests = cdev.execute("""SELECT COUNT(*) FROM Probe_Requests WHERE ((First_Record >= ? and First_Record <= ?) or (Last_Time_Found > ? and Last_Time_Found <= ?))""", (dataAnalizar, dataAtual, dataAnalizar, dataAtual)).fetchall()
+    df_all = pd.read_sql_query("SELECT * FROM Probe_Requests WHERE Timestamp >= ?", dr_con, params=(previous_start,))
 
-    # Device counting - All
-    detected_devices = rows_data_packets[0][0] + rows_probe_requests[0][0]
+    if not df_all.empty:
 
-    cdev.close()
-    conndev.close()
+        # 1. Split data into the Current Window and Previous Window
+        df_current = df_all[
+            (df_all['Timestamp'] >= current_start) &
+            (df_all['Timestamp'] <= current_end)
+        ]
 
-except sqlite3.Error as error:
-    print("Failed to read number of devices detected from local database.")
+        df_previous = df_all[
+            (df_all['Timestamp'] >= previous_start) &
+            (df_all['Timestamp'] < previous_end)
+        ]
 
+        total_current_packets = len(df_current)
+        total_previous_packets = len(df_previous)
 
+        
+        # FEATURE 1: FREQUENCY DELTAS (New & Disappeared)
+        
 
-# Upload via Wi-Fi
-if uploadTechnology.lower() == "wifi" and wifi_connected:
+        # Count the occurrences of each fingerprint in both windows
+        counts_current = df_current['Fingerprint'].value_counts()
+        counts_previous = df_previous['Fingerprint'].value_counts()
 
-    dataAtual_unix = int(dataAtual.timestamp())
+        # Combine them into a single table. Fill missing ones with 0.
+        df_counts = pd.DataFrame({
+            'current': counts_current,
+            'previous': counts_previous
+        }).fillna(0)
 
-    mqtt_confirmation = publish_detections_mqtt_message(dataAtual_unix, detected_devices, f"sttoolkit-test/mqtt/wifi/numdetections/{influxdb_bucket}/{ip_address}/{sensorName}/{sensorUUID}")
+        # Calculate mathematical differences.
+        # .clip(lower=0) ensures we don't get negative counts.
+        total_new = (df_counts['current'] - df_counts['previous']).clip(lower=0).sum()
+        total_disappeared = (df_counts['previous'] - df_counts['current']).clip(lower=0).sum()
 
-    if mqtt_confirmation is True:
-
-        # Check if exists a pending measurement to send
-        while get_1st_pending_measurement() is not None:
-
-            # Send first pending measurement from database, and wait for its confirmation
-            unix_ts = get_1st_pending_measurement()[0]
-            devices_detected = get_1st_pending_measurement()[1]
-
-            mqtt_pend_confirmation = publish_detections_mqtt_message(unix_ts, devices_detected, f"sttoolkit-test/mqtt/wifi/numdetections/{influxdb_bucket}/{ip_address}/{sensorName}/{sensorUUID}")
-
-            if mqtt_pend_confirmation is True:
-                # Remove first pending measurement from database
-                remove_1st_pending_measurement()
-                continue
-            else:
-                break
-
-
-# Upload via LoRa
-elif uploadTechnology.lower() == "lora":
-
-    # Send message to Helium
-    cmd = f"sudo rak811 -v send \"{detected_devices},{influxdb_bucket},{sensorName}\""
-    output = subprocess.check_output(cmd, shell=True, timeout=300)
-
-    #If message was not sent
-    if "RAK811 timeout" in str(output) or "error" in str(output):
-
-        #Check LoRa connection
-        if check_lora_connection() == False:
-
-            print("There is no lora connection. Trying to reconnect to Helium network...")
-
-            #If no LoRa connection, try to reestablish it
-            reestablish_lora_connection()
-
-    else:
-
-        # Check if downlink message is available
-        if "No downlink available" in str(output):
-            print("Downlink not available.")
+        # New fingerprints are normalized by the CURRENT traffic
+        if total_current_packets > 0:
+            norm_new_fingerprints = total_new / total_current_packets
         else:
-            print(f"Downlink message received: '{output}'.")
+            norm_new_fingerprints = 0.0
 
-            #Payload parsing and decoding
-            data_payload_split = str(output).split('Data: ', 1)[1]
-            data_payload_hex = data_payload_split.split('\\n')[0]
-            payload = bytes.fromhex(data_payload_hex).decode('utf-8')
+        # Disappeared fingerprints are normalized by the PREVIOUS traffic
+        if total_previous_packets > 0:
+            norm_disappeared_fingerprints = total_disappeared / total_previous_packets
+        else:
+            norm_disappeared_fingerprints = 0.0
 
-            print(f"Received '{payload}'.")
+        print(f"[DEBUG] total_current_packets = {total_current_packets}")
+        print(f"[DEBUG] total_previous_packets = {total_previous_packets}")
+        print(f"[DEBUG] total_new = {total_new}")
+        print(f"[DEBUG] total_disappeared = {total_disappeared}")
+        print(f"[DEBUG] norm_new_fingerprints = {norm_new_fingerprints}")
+        print(f"[DEBUG] norm_disappeared_fingerprints = {norm_disappeared_fingerprints}")
 
-            # Message received for rebooting sensor
-            if payload == "r":
-                print("Message received for rebooting sensor")
-                cmd ="sudo reboot"
-                os.system(cmd)
+        
+        # FEATURE 2: CURRENT WINDOW FEATURES FOR ML MODEL
+        
+        current_features = {
+        'Total_Packets': 0,
+        'Total_Bursts': 0,
+        'Unique_MACs': 0, 
+        'Unique_Fingerprints': 0,
+        'Packets_Per_Fingerprint': 0.0,
+        'Bursts_Per_Fingerprint': 0.0
+        }
 
-            # Message received for activating detection on sensor
-            elif payload == "a":
-                print("Message received for activating detection on sensor")
-                receive_active()
+        if total_current_packets > 0:
+            unique_macs = df_current['MAC'].nunique()
+            unique_fingerprints = df_current['Fingerprint'].nunique()
+            total_bursts = int(df_current.get('Is_New_Burst', pd.Series([0])).sum())
 
-            # Message received for disabling detection on sensor
-            elif payload == "dis":
-                print("Message received for disabling detection on sensor")
-                receive_disable()
-
+            if unique_fingerprints > 0:
+                packets_per_fingerprint = total_current_packets / unique_fingerprints
+                bursts_per_fingerprint = total_bursts / unique_fingerprints
             else:
+                packets_per_fingerprint = 0.0
+                bursts_per_fingerprint = 0.0
 
-                    # Check type of message received rather than general actions ('c', 'd', or 'del')
-                    type_msg = payload.split(",")[0]
+            current_features = {
+            'Total_Packets': total_current_packets,
+            'Total_Bursts': total_bursts,
+            'Unique_MACs': unique_macs,
+            'Unique_Fingerprints': unique_fingerprints,
+            'Packets_Per_Fingerprint': packets_per_fingerprint,
+            'Bursts_Per_Fingerprint': bursts_per_fingerprint
+            }
 
-                    # Message received for updating sensor configuration
-                    if type_msg == 'c':
-                        print("Message received for updating sensor configuration")
+            # Manage History Buffer
+            if os.path.exists(HISTORY_FILE):
+                df_history = pd.read_csv(HISTORY_FILE)
+                df_history = pd.concat([df_history, pd.DataFrame([current_features])], ignore_index=True)
+            else:
+                df_history = pd.DataFrame([current_features])
 
-                        #Number of payload segments
-                        segments_numb = int(payload.split(",")[1])
+            # Keep only the last TIME_STEPS rows
+            if len(df_history) > TIME_STEPS:
+                df_history = df_history.tail(TIME_STEPS).reset_index(drop=True)
 
-                        #If the payload was not segmented, interpret it right away
-                        if segments_numb == 1:
-                            update_config("lora", payload[6:])
+            df_history.to_csv(HISTORY_FILE, index=False)
 
-                        #If the payload was segmented, reconstruct it
-                        elif segments_numb > 1:
+            # Prepare for LSTM
+            pad_needed = TIME_STEPS - len(df_history)
+            if pad_needed > 0:
+                padding = pd.DataFrame([current_features] * pad_needed)
+                df_sequence = pd.concat([padding, df_history], ignore_index=True)
+            else:
+                df_sequence = df_history
 
-                            #Get current segment
-                            curr_segment = int(payload.split(",")[2])
+            raw_sequence_array = df_sequence[FEATURE_COLS].values
 
-                            if curr_segment == 1: file = open("/home/kali/Desktop/payload_config.txt", 'w+')
-                            else:                 file = open("/home/kali/Desktop/payload_config.txt", 'a+')
+            # Scale the 3x6 matrix
+            sequence_scaled = scaler.transform(raw_sequence_array)
+            
+            # Reshape to 3D: (1 sample, 3 time steps, 6 features)
+            X_live_reshaped = sequence_scaled.reshape(1, TIME_STEPS, sequence_scaled.shape[1])
 
-                            #Append payload
-                            file.write(payload[6:])
+            raw_prediction = model.predict(X_live_reshaped, verbose=0)[0][0]
+            detected_devices = max(0, int(np.round(raw_prediction)))
 
-                            if curr_segment == segments_numb:
-                                file.seek(0)
-                                rec_payload = file.readline().strip('\n')
-                                update_config("lora", rec_payload)
+    dr_con.close()
 
-                            file.close()
+except sqlite3.Error as e:
+    print(f"Failed to read extracted information from local database: {e}")
+except Exception as e:
+    print(f"Error during ML prediction or data processing: {e}")
 
-                        else:
-                            print("Number of segments received from message is incorrect. Exiting program.")
-                            exit(0)
+init_measurement_buffer()
 
-                    # Message received for updating default configuration
-                    elif type_msg == "d":
-                        print("Message received for updating default configuration")
+# Sequence number for LoRa messages, to be included in payload 
+lora_seq = get_and_increment_lora_seq()
 
-                        if payload.split(",")[1].isnumeric and len(payload.split(",")[1]) == 1:
+# Save to buffer for potential replay (LoRa) or later upload (Wi-Fi failure)
+buffer_insert(lora_seq, dataAtual_unix, int(detected_devices))
 
-                            #Number of payload segments
-                            segments_numb = int(payload.split(",")[1])
+log_event(
+    "buffer_insert",
+    seq=lora_seq,
+    unix_ts=dataAtual_unix,
+    devices=int(detected_devices)
+)
 
-                            #If the payload was not segmented, interpret it right away
-                            if segments_numb == 1:
-                                update_default(payload[6:])
+# wifi_topic = f"sttoolkit-test/mqtt/wifi/numdetections/{influxdb_bucket}/{ip_address}/{sensorName}/{sensorUUID}"
+wifi_topic = f"sttoolkit-test/mqtt/wifi/v2/numdetections/{sensorUUID}"
 
-                            #If the payload was segmented, reconstruct it
-                            elif segments_numb > 1:
+manager = CommunicationManager(cwifi, wifi_topic)
+upload_technology, selected_lora_network = manager.load_cached_uplink()
 
-                                #Get current segment
-                                curr_segment = int(payload.split(",")[2])
+log_event(
+    "send_selected_technology",
+    upload_technology=upload_technology,
+    selected_lora_network=selected_lora_network,
+    active_lora_network=active_lora_network,
+    devices=int(detected_devices)
+)
 
-                                if curr_segment == 1: file = open("/home/kali/Desktop/payload_config.txt", 'w+')
-                                else:                 file = open("/home/kali/Desktop/payload_config.txt", 'a+')
+# ── Timeline: registar inicio do script e fim do preprocessing ──  
+log_timeline("script_start", lora_seq, upload_technology,           
+             ts_override=_t0_wall)                                  
+log_timeline("ready_to_send", lora_seq, upload_technology)          
 
-                                #Append payload
-                                file.write(payload[6:])
+# Keep backward compatibility with legacy LoRa flow using selected network.
+if selected_lora_network:
+    active_lora_network = selected_lora_network
 
-                                if curr_segment == segments_numb:
-                                    file.seek(0)
-                                    rec_payload = file.readline().strip('\n')
-                                    update_default(rec_payload)
 
-                                file.close()
 
-                    # Message received for deleting sensor configuration
-                    elif type_msg == 'del':
-                        print("Message received for deleting sensor configuration")
 
-                        # Check if message is for this sensor from payload
-                        sensor_uuid_payload = payload.split(",")[1]
+# Keep LoRa send path unchanged for now; manager handles Wi-Fi and no-connectivity cases.
+sent_over_wifi = False
 
-                        try:
-                            connwifi = sqlite3.connect('/home/kali/Desktop/DB/SensorConfiguration.db', timeout=30)
-                            cwifi = connwifi.cursor()
+if upload_technology != "lora":
+                     
 
-                            uuid_from_mac_addr = cwifi.execute("""SELECT Sensor_UUID from SensorConfiguration""").fetchone()
+    if SEND_EXTENDED_FINGERPRINTS:
+        sent_over_wifi = manager.send_current_measurement(
+            dataAtual_unix, int(detected_devices),
+            norm_new=norm_new_fingerprints,
+            norm_disappeared=norm_disappeared_fingerprints,
+            seq=lora_seq
+        )
+    else:
+        sent_over_wifi = manager.send_current_measurement(
+            dataAtual_unix, int(detected_devices),
+            seq=lora_seq
+        )
+    
+    if sent_over_wifi:
+                   
+        log_event(
+            "message_sent",
+            link="wifi",
+            unix_ts=dataAtual_unix,
+            devices=int(detected_devices)
+        )
 
-                            if uuid_from_mac_addr is None:
-                                uuid_from_mac_addr = uuid.getnode()
-                            else:
-                                uuid_from_mac_addr = uuid_from_mac_addr[0]
-
-                        except sqlite3.Error as error:
-                            print("Error while connecting to database.", error)
-
-                        if str(sensor_uuid_payload) == str(uuid_from_mac_addr):
-                            delete_config()
-
-                        else:
-                            print("Number of segments received from message is incorrect. Exiting program.")
-                            exit(0)
-
-                    # Message received for specifically rebooting this sensor
-                    elif type_msg == 'r':
-
-                        # Check if message is for this sensor from payload
-                        sensor_uuid_payload = payload.split(",")[1]
-
-                        try:
-                            connwifi = sqlite3.connect('/home/kali/Desktop/DB/SensorConfiguration.db', timeout=30)
-                            cwifi = connwifi.cursor()
-
-                            uuid_from_mac_addr = cwifi.execute("""SELECT Sensor_UUID from SensorConfiguration""").fetchone()
-
-                            if uuid_from_mac_addr is None:
-                                uuid_from_mac_addr = uuid.getnode()
-                            else:
-                                uuid_from_mac_addr = uuid_from_mac_addr[0]
-
-                        except sqlite3.Error as error:
-                            print("Error while connecting to database.", error)
-
-                        if str(sensor_uuid_payload) == str(uuid_from_mac_addr):
-                            os.sys("sudo reboot")
-
-                        else:
-                            print("Number of segments received from message is incorrect. Exiting program.")
-                            exit(0)
+    elif upload_technology == "wifi":
+        log_timeline("send_failed", lora_seq, "wifi")               
+        log_event(
+            "message_stored",
+            unix_ts=dataAtual_unix,
+            devices=int(detected_devices),
+            reason="wifi_send_failed"
+        )
 
 else:
-    print("WARNING: No communication available for sending crowding measurements! \n\
-        Please check the network conectivity for uploading data to the cloud server.")
+    dprint("Skipping manager send because upload_technology=lora (legacy LoRa flow)")
 
-    dataAtual_unix = int(dataAtual.timestamp())
 
-    print("\nFailed to publish mqtt message.")
-    print("\nSaving detection in database to send later, when conection available.")
-    #save measurement in database
-    store_pending_measurement(dataAtual_unix, detected_devices)
+if sent_over_wifi:
+    confirmed = get_last_confirmed_seq()
+    last_ack  = get_last_ack_seq()
+
+    # Usar o mais conservador: last_confirmed_seq se existir
+    replay_base = confirmed if confirmed is not None else last_ack
+
+    if replay_base is None:
+        set_last_ack_seq(lora_seq)
+        set_last_confirmed_seq(lora_seq)
+        dprint(f"First run: initialized ack={lora_seq} confirmed={lora_seq}")
+    else:
+        # A medicao atual ja recebeu PUBACK. O replay abrange apenas as
+        # sequencias entre replay_base (exclusive) e lora_seq (exclusive).
+        expected_replay = (lora_seq - replay_base - 1) % 256
+
+        if expected_replay == 0:
+            # Nao existe gap: a medicao atual prolonga a sequencia confirmada.
+            set_last_ack_seq(lora_seq)
+            set_last_confirmed_seq(lora_seq)
+        else:
+            log_event(
+                "replay_started",
+                link="wifi",
+                expected=expected_replay,
+                replay_base=replay_base,
+                current_seq=lora_seq,
+            )
+
+            replayed = manager.replay_from_buffer(replay_base, lora_seq)
+
+            if replayed == expected_replay:
+                # So se avanca ate ao atual quando todo o gap foi recuperado.
+                set_last_ack_seq(lora_seq)
+                set_last_confirmed_seq(lora_seq)
+                log_event(
+                    "replay_complete",
+                    link="wifi",
+                    replayed=replayed,
+                    expected=expected_replay,
+                    current_seq=lora_seq,
+                )
+            else:
+                # O replay e cronologico. Numa recuperacao parcial, avanca-se
+                # apenas pelo prefixo efetivamente confirmado, nunca ate ao atual.
+                partial_ack = (replay_base + replayed) % 256
+                if replayed > 0:
+                    set_last_ack_seq(partial_ack)
+                    set_last_confirmed_seq(partial_ack)
+
+                log_event(
+                    "replay_incomplete",
+                    link="wifi",
+                    replayed=replayed,
+                    expected=expected_replay,
+                    remaining=expected_replay - replayed,
+                    confirmed_through=partial_ack if replayed > 0 else replay_base,
+                    current_seq=lora_seq,
+                )
+
+            dprint(
+                f"replay_from_buffer(base={replay_base}, current={lora_seq}) "
+                f"-> {replayed}/{expected_replay}"
+            )
+
+else:
+    dprint("No replay executed (current send failed or uplink not wifi)")
+
+
+print(f"[INFO] Current upload technology: {upload_technology}")
+
+
+# Upload via LoRa - legacy flow kept, gated by manager decision
+# Upload via LoRa - legacy flow kept, gated by manager decision
+if upload_technology == "lora":
+    dprint(f"Entering LoRa block with network={active_lora_network}")
+
+    # Verificar se o módulo está em duty cycle restriction
+    duty_file = "/tmp/rak_duty_restricted"
+    if os.path.exists(duty_file):
+        try:
+            ts_restricted = int(open(duty_file).read().strip())
+            age_h = (time.time() - ts_restricted) / 3600
+            if age_h < 24:
+                print(
+                    f"[UPLOAD] Module in duty cycle restriction "
+                    f"({age_h:.1f}h ago) — measurement stored in buffer only"
+                )
+                log_event(
+                    "message_stored",
+                    unix_ts=dataAtual_unix,
+                    devices=int(detected_devices),
+                    reason="duty_cycle_active",
+                    network=active_lora_network
+                )
+                # Saltar todo o bloco LoRa
+                upload_technology = "duty_restricted"
+            else:
+                os.remove(duty_file)
+                print("[UPLOAD] Duty cycle flag expired, attempting send")
+        except Exception:
+            try:
+                os.remove(duty_file)
+            except Exception:
+                pass
+
+if upload_technology == "lora":
+
+    if not active_lora_network:
+        print("[UPLOAD] Upload_Technology is 'lora' but Active_LoRa_Network is NULL!")
+        print("[UPLOAD] Run sensorCommunicationCheck.py to trigger handover")
+        exit(1)
+
+    print(f"[UPLOAD] Using LoRa ({active_lora_network}) to send data (count: {detected_devices})")
+
+    try:
+        network_creds = cwifi.execute(
+            """SELECT app_eui, app_key, dev_eui FROM LoRaNetworks WHERE name=?""",
+            (active_lora_network,)
+        ).fetchone()
+
+        if network_creds is None:
+            print(f"[UPLOAD] Network '{active_lora_network}' not found in LoRaNetworks table!")
+            exit(1)
+
+        app_eui, app_key, dev_eui = network_creds
+        print(f"[UPLOAD] Using credentials for {active_lora_network} (Dev EUI: {dev_eui})")
+
+    except sqlite3.Error as error:
+        print(f"[UPLOAD] Failed to read LoRa credentials: {error}")
+        exit(1)
+
+    uart_locked, waited_for_uart_lock = wait_for_lora_uart_lock(
+        caller="sendCrowdingData_lora",
+        max_wait_sec=120,
+        poll_sec=2
+    )
+
+    if not uart_locked:
+        print("[UPLOAD] LoRa UART busy. Storing measurement and exiting this cycle.")
+
+
+        log_event(
+            "message_stored",
+            unix_ts=dataAtual_unix,
+            devices=int(detected_devices),
+            reason="uart_locked",
+            network=active_lora_network
+        )
+
+    else:
+        rak = None
+
+        try:
+            rak = RAK3172("/dev/ttyAMA0", 115200)
+            rak.connect()
+
+            print(f"[UPLOAD] Configuring RAK3172 for {active_lora_network}")
+            rak.set_dev_eui(dev_eui)
+            rak.set_app_eui(app_eui)
+            rak.set_app_key(app_key)
+
+            
+            joined = check_lora_network_status(active_lora_network)
+
+            if not joined:
+                print(f"[UPLOAD] Not joined to {active_lora_network}, marking as failed")
+                mark_lora_network_failed(active_lora_network)
+
+                cwifi.execute(
+                    """UPDATE SensorCommunication SET LoRaConnected=?, Last_Update=CURRENT_TIMESTAMP""",
+                    (False,)
+                )
+
+                connwifi.commit()
+
+                print("[UPLOAD] Handover will be triggered on next sensorCommunicationCheck cycle")
+
+            else:
+                count = int(detected_devices)
+
+                if SEND_EXTENDED_FINGERPRINTS:
+                    norm_new_enc = min(int(round(norm_new_fingerprints * 10000)), 65535)
+                    norm_dis_enc = min(int(round(norm_disappeared_fingerprints * 10000)), 65535)
+
+                    if count <= 255:
+                        payload_bytes = struct.pack(">BBHH", lora_seq, count, norm_new_enc, norm_dis_enc)
+                    else:
+                        payload_bytes = struct.pack(">BHHH", lora_seq, count, norm_new_enc, norm_dis_enc)
+                else:
+                    if count <= 255:
+                        payload_bytes = struct.pack(">BB", lora_seq, count)
+                    else:
+                        payload_bytes = struct.pack(">BH", lora_seq, count)
+
+                payload_hex = payload_bytes.hex()
+                print(f"[UPLOAD] Sending payload: count={count} ({len(payload_bytes)} byte(s)) (hex: {payload_hex})")
+
+                log_timeline("send_start", lora_seq, "lora",        
+                             network=active_lora_network)           
+
+                sent = rak.send_lorawan_data(1, payload_hex)  # Port 1 = crowding
+
+                if not sent:
+                    log_timeline("send_failed", lora_seq, "lora",   
+                                 network=active_lora_network)       
+                    print(
+                        f"[UPLOAD] Failed to send via {active_lora_network} "
+                        f"(duty cycle restriction — skipping until next success)"
+                    )
+                    try:
+                        with open("/tmp/rak_duty_restricted", "w") as f:
+                            f.write(str(int(time.time())))
+                    except Exception:
+                        pass
+                    log_event(
+                        "message_stored",
+                        unix_ts=dataAtual_unix,
+                        devices=int(detected_devices),
+                        reason="lora_send_failed_duty_cycle",
+                        network=active_lora_network
+                    )
+
+                else:
+                    log_timeline("ack_received", lora_seq, "lora",  
+                                 network=active_lora_network)       
+                    print(f"[UPLOAD] Successfully sent via {active_lora_network}")
+                    try:
+                        if os.path.exists("/tmp/rak_duty_restricted"):
+                            os.remove("/tmp/rak_duty_restricted")
+                    except Exception:
+                        pass
+                                        # ── Replay proativo do buffer ──────────────────────
+                    last_ack = get_last_ack_seq()
+
+                    if last_ack is None:
+                        # Firt run 
+                        set_last_ack_seq(lora_seq)
+                        dprint(f"First LoRa run: initialized last_ack_seq={lora_seq}")
+
+                    else:
+                        gap = (lora_seq - last_ack) % 256
+
+                        if gap > 1:
+                            # Há medições não confirmadas entre last_ack e lora_seq
+                            # lora_seq já foi enviado no FPort 1; replay é last_ack+1 até lora_seq-1
+                            prev_seq = (lora_seq - 1) % 256
+                            pending = buffer_get_range(last_ack, prev_seq)
+
+                            if pending:
+                                # Limitar a 10 por pacote FPort 4
+                                LORA_REPLAY_MAX = 10
+                                batch = pending[:LORA_REPLAY_MAX]
+                                batch_size = len(batch)
+                                seq_oldest = batch[0][0]  # seq do primeiro
+
+                                ts_oldest = batch[0][1]
+                                replay_payload = struct.pack(">BI", seq_oldest, ts_oldest)
+                                for (_, _, devices) in batch:
+                                    replay_payload += struct.pack(">H", min(int(devices), 65535))
+
+                                replay_hex = replay_payload.hex()
+                                print(
+                                    f"[UPLOAD][REPLAY] proactive batch={batch_size} "
+                                    f"SEQ_oldest={seq_oldest} hex={replay_hex}"
+                                )
+
+                                time.sleep(3)
+
+                                sent_replay = rak.send_lorawan_data(4, replay_hex)
+
+                                if sent_replay:
+                                    log_event(
+                                        "lora_replay_sent",
+                                        link="lora",
+                                        network=active_lora_network,
+                                        batch_size=batch_size,
+                                        seq_oldest=seq_oldest,
+                                    )
+                                    print(f"[UPLOAD][REPLAY] {batch_size} medições enviadas.")
+                                else:
+                                    log_event(
+                                        "lora_replay_failed",
+                                        link="lora",
+                                        network=active_lora_network,
+                                        batch_size=batch_size,
+                                    )
+                                    print("[UPLOAD][REPLAY] Falha — servidor pedirá via downlink.")
+                            else:
+                                dprint("Buffer vazio para o range pedido.")
+
+                        # Atualizar last_ack_seq independentemente do replay
+                        set_last_ack_seq(lora_seq)
+                    # Remove lock-wait and startup-lock-wait from the Class C listen window.
+                    downlink_seconds = (
+                        (int(upload_periodicity) * 60)
+                        - 25
+                        - waited_for_check
+                        - waited_for_comm_available
+                        - waited_for_uart_lock
+                    )
+
+                    if downlink_seconds < 0:
+                        downlink_seconds = 0
+
+                    print(
+                        f"[UPLOAD] Listening for downlinks for {downlink_seconds:.0f}s "
+                        f"(adjusted for wait={waited_for_comm_available}s)..."
+                    )
+
+                    t_end = time.time() + downlink_seconds
+
+                    log_event(
+                        "lora_classC_start",
+                        network=active_lora_network,
+                        listen_seconds=downlink_seconds,
+                        uart_locked=True
+                    )
+
+                    try:
+                        while time.time() < t_end:
+                            port, payload = rak.receive_data_C()
+
+                            if port and payload:
+                                if int(port) == 5:
+                                    # ── Gap fill request do servidor ──
+                                    handle_gap_fill_request(
+                                        rak, payload, lora_seq, active_lora_network
+                                    )
+                                else:
+                                    downlink_cb("C", port, len(payload), payload, rak=rak)
+
+                                log_event(
+                                    "downlink_received",
+                                    port=port,
+                                    payload_hex=payload
+                                )
+
+                            time.sleep(1)
+
+                    except KeyboardInterrupt:
+                        print("[UPLOAD] Interrupted by user, exiting...")
+
+                    except Exception as e:
+                        print(f"[UPLOAD] LoRa communication error: {e}")
+                        mark_lora_network_failed(active_lora_network)
+
+                    finally:
+                        log_event(
+                            "lora_classC_end",
+                            network=active_lora_network
+                        )
+
+        finally:
+            if rak is not None:
+                try:
+                    rak.disconnect()
+                except Exception:
+                    pass
+
+            release_uart_lock()
+    
+
+
+elif upload_technology == "none":
+    print(
+        "WARNING: No communication available for sending crowding measurements! \n"
+        "        Please check the network conectivity for uploading data to the cloud server."
+    )
+
 
 cwifi.close()
 connwifi.close()
+
+log_timeline("script_end", lora_seq, upload_technology)             
+
+log_event(
+    "send_cycle_complete",
+    cycle_ms=round((time.monotonic() - _t0_send_cycle) * 1000, 2)
+)
