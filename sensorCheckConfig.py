@@ -56,10 +56,9 @@ def show_sensor_configuration():
             print("Upload Technology:      " + str(current_configuration[0][12]))
         else:
             print("Upload Technology:      " + colored("Not Available", 'yellow'))
-        #print("Reboot Periodicity:     " + str(current_configuration[0][13]))
-        #print("Reboot Time:            " + str(datetime.strptime(str(current_configuration[0][14]), "%H").strftime("%I:%M %p")))
-        #print("Last Update:            " + str(convert_to_timezone(current_configuration[0][15], '%Y-%m-%d %H:%M:%S', 'Europe/Lisbon'))[:-6])
-        print("Last Update:            " + str(convert_to_timezone(current_configuration[0][13], '%Y-%m-%d %H:%M:%S', 'Europe/Lisbon'))[:-6])
+        print("Reboot Periodicity:     " + str(current_configuration[0][13]))
+        print("Reboot Time:            " + str(datetime.strptime(str(current_configuration[0][14]), "%H").strftime("%I:%M %p")))
+        print("Last Update:            " + str(convert_to_timezone(current_configuration[0][15], '%Y-%m-%d %H:%M:%S', 'Europe/Lisbon'))[:-6])
 
     elif general_information_rows == 0:
 
@@ -90,8 +89,8 @@ def show_default_configuration():
         print("Authorization token:    " + str(current_configuration[0][7]))
         print("Messages periodicity:   Every " + str(current_configuration[0][8]) + " minutes")
         print("Sliding Window:         Last " + str(current_configuration[0][9]) + " minutes")
-        #print("Reboot Periodicity:     " + str(current_configuration[0][10]))
-        #print("Reboot Time:            " + str(datetime.strptime(str(current_configuration[0][11]), "%H").strftime("%I:%M %p")))
+        print("Reboot Periodicity:     " + str(current_configuration[0][10]))
+        print("Reboot Time:            " + str(datetime.strptime(str(current_configuration[0][11]), "%H").strftime("%I:%M %p")))
         print("Last Update:            " + str(convert_to_timezone(current_configuration[0][12], '%Y-%m-%d %H:%M:%S', 'Europe/Lisbon'))[:-6])
 
     elif general_information_rows == 0:
