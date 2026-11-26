@@ -311,6 +311,7 @@ This repository is the **edge sensor** part of the MoniCrowd architecture. Relat
 
 - **MoniCrowd:** https://github.com/sensinglab/monicrowd
 - **Crowd server:** https://github.com/sensinglab/crowd-server
+- **Fingerprinting and ML toolkit:** https://github.com/sensinglab/monicrowd-fingerprinting-ml
 - **Project website:** https://monicrowd.sensinglab.eu
 
 ---
